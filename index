@@ -1,0 +1,525 @@
+import { useState, useEffect, useCallback, useRef } from "react";
+
+// ============================================================
+// CONFIG & STORAGE
+// ============================================================
+
+const STORAGE_KEY = "kurage_v1";
+const load = () => { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)); } catch { return null; } };
+const save = (d) => localStorage.setItem(STORAGE_KEY, JSON.stringify(d));
+const todayKey = (d) => d?.debugDate || new Date().toISOString().split("T")[0];
+
+const DECAY_RATE = 0.07; // water level drops per hour (0-1 scale), ~14h to empty
+const DRINK_AMOUNT = 0.14; // each tap adds this much (roughly 7 taps to fill)
+
+function createData() {
+  return {
+    waterLevel: 0.3,
+    lastUpdate: Date.now(),
+    history: {},
+    achievedDates: [],
+    totalDrinks: 0,
+    streakBest: 0,
+    debugDate: null,
+  };
+}
+
+function getStreak(dates) {
+  if (!dates.length) return 0;
+  const sorted = [...dates].sort().reverse();
+  const today = new Date().toISOString().split("T")[0];
+  let s = 0, cd = new Date(today);
+  if (!sorted.includes(today)) cd.setDate(cd.getDate() - 1);
+  for (let i = 0; i < 999; i++) {
+    if (sorted.includes(cd.toISOString().split("T")[0])) { s++; cd.setDate(cd.getDate() - 1); }
+    else break;
+  }
+  return s;
+}
+
+function applyDecay(data) {
+  const now = Date.now();
+  const hours = (now - data.lastUpdate) / 3600000;
+  const newLevel = Math.max(0, data.waterLevel - hours * DECAY_RATE);
+  return { ...data, waterLevel: newLevel, lastUpdate: now };
+}
+
+function getWaterState(level) {
+  if (level >= 0.9) return { id: "full", label: "きもちいい〜", glow: true };
+  if (level >= 0.6) return { id: "normal", label: "すいすい〜", glow: false };
+  if (level >= 0.3) return { id: "low", label: "ちょっとのどかわいた…", glow: false };
+  return { id: "empty", label: "しずかです…", glow: false };
+}
+
+const MESSAGES = {
+  full: ["きもちいい〜！", "ふわふわ〜♪", "水がたっぷり！", "きらきら〜✨", "ありがとう！最高〜"],
+  normal: ["すいすい〜", "いいかんじ♪", "ふわ〜", "きょうもよろしくね", "おさんぽ中〜"],
+  low: ["ちょっとのどかわいたな…", "お水ほしいな…", "泡がすくないよ…", "ふぅ…"],
+  empty: ["しずかです…", "…", "水がすくないよ…", "だれかいる…？"],
+};
+
+const DRINK_REACTIONS = [
+  "ぽこっ！うれしい！",
+  "ふわぁ〜♪",
+  "つめたくてきもちいい！",
+  "ありがとう〜！",
+  "ぷかぷか♪",
+  "おみずだ〜！",
+  "しあわせ〜",
+  "もっとおよげる！",
+];
+
+// ============================================================
+// ANIMATED JELLYFISH (pure CSS)
+// ============================================================
+
+function Jellyfish({ waterLevel, glow }) {
+  const speed = waterLevel > 0.6 ? "4s" : waterLevel > 0.3 ? "6s" : "9s";
+  const opacity = waterLevel > 0.3 ? 1 : 0.6;
+  const scale = 0.8 + waterLevel * 0.3;
+  const glowFilter = glow ? "drop-shadow(0 0 20px rgba(180,220,255,0.9)) drop-shadow(0 0 40px rgba(120,180,255,0.5))" : "drop-shadow(0 0 8px rgba(180,220,255,0.3))";
+
+  return (
+    <div style={{
+      position: "absolute",
+      top: `${25 - waterLevel * 10}%`,
+      left: "50%",
+      transform: `translateX(-50%) scale(${scale})`,
+      opacity,
+      filter: glowFilter,
+      transition: "all 1.5s ease",
+      zIndex: 10,
+    }}>
+      <svg width="120" height="140" viewBox="0 0 120 140">
+        <defs>
+          <radialGradient id="jellyGrad" cx="50%" cy="30%" r="60%">
+            <stop offset="0%" stopColor={glow ? "#e8f4ff" : "#d4eaf7"} />
+            <stop offset="50%" stopColor={glow ? "#a8d8ff" : "#89c4e8"} />
+            <stop offset="100%" stopColor={glow ? "#6bb8f0" : "#5a9ec4"} />
+          </radialGradient>
+          <radialGradient id="jellyInner" cx="50%" cy="40%" r="40%">
+            <stop offset="0%" stopColor="rgba(255,255,255,0.5)" />
+            <stop offset="100%" stopColor="rgba(255,255,255,0)" />
+          </radialGradient>
+        </defs>
+        <style>{`
+          @keyframes jellyPulse { 0%,100%{transform:scaleX(1) scaleY(1)} 50%{transform:scaleX(1.06) scaleY(0.94)} }
+          @keyframes jellyFloat { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-12px)} }
+          @keyframes tentacle1 { 0%,100%{d:path("M35,70 Q30,100 25,130")} 50%{d:path("M35,70 Q40,105 30,130")} }
+          @keyframes tentacle2 { 0%,100%{d:path("M60,75 Q58,105 55,135")} 50%{d:path("M60,75 Q65,108 60,135")} }
+          @keyframes tentacle3 { 0%,100%{d:path("M85,70 Q90,100 95,130")} 50%{d:path("M85,70 Q80,105 90,130")} }
+        `}</style>
+        <g style={{ animation: `jellyFloat ${speed} ease-in-out infinite` }}>
+          <g style={{ animation: `jellyPulse ${speed} ease-in-out infinite`, transformOrigin: "60px 45px" }}>
+            {/* Bell */}
+            <ellipse cx="60" cy="45" rx="42" ry="35" fill="url(#jellyGrad)" opacity="0.85" />
+            <ellipse cx="60" cy="45" rx="36" ry="30" fill="url(#jellyInner)" />
+            {/* Eyes */}
+            <circle cx="48" cy="42" r="3.5" fill="#2a5070" opacity="0.7" />
+            <circle cx="72" cy="42" r="3.5" fill="#2a5070" opacity="0.7" />
+            <circle cx="49" cy="41" r="1.2" fill="#fff" />
+            <circle cx="73" cy="41" r="1.2" fill="#fff" />
+            {/* Mouth */}
+            {waterLevel > 0.6 ? (
+              <path d="M54,52 Q60,57 66,52" fill="none" stroke="#2a5070" strokeWidth="1.5" opacity="0.6" strokeLinecap="round" />
+            ) : waterLevel > 0.3 ? (
+              <ellipse cx="60" cy="53" rx="3" ry="1.5" fill="#2a5070" opacity="0.4" />
+            ) : (
+              <path d="M54,55 Q60,51 66,55" fill="none" stroke="#2a5070" strokeWidth="1.5" opacity="0.6" strokeLinecap="round" />
+            )}
+            {/* Rim */}
+            <path d="M18,55 Q30,68 60,70 Q90,68 102,55" fill="none" stroke="rgba(100,180,230,0.4)" strokeWidth="2" />
+          </g>
+          {/* Tentacles */}
+          <path d="M35,70 Q30,100 25,130" fill="none" stroke="rgba(130,195,240,0.5)" strokeWidth="2.5" strokeLinecap="round"
+            style={{ animation: `tentacle1 ${parseFloat(speed) * 1.3}s ease-in-out infinite` }} />
+          <path d="M45,72 Q42,98 38,125" fill="none" stroke="rgba(130,195,240,0.4)" strokeWidth="2" strokeLinecap="round"
+            style={{ animation: `tentacle1 ${parseFloat(speed) * 1.5}s ease-in-out infinite 0.3s` }} />
+          <path d="M60,75 Q58,105 55,135" fill="none" stroke="rgba(130,195,240,0.5)" strokeWidth="2.5" strokeLinecap="round"
+            style={{ animation: `tentacle2 ${parseFloat(speed) * 1.2}s ease-in-out infinite 0.2s` }} />
+          <path d="M75,72 Q78,98 82,125" fill="none" stroke="rgba(130,195,240,0.4)" strokeWidth="2" strokeLinecap="round"
+            style={{ animation: `tentacle3 ${parseFloat(speed) * 1.5}s ease-in-out infinite 0.5s` }} />
+          <path d="M85,70 Q90,100 95,130" fill="none" stroke="rgba(130,195,240,0.5)" strokeWidth="2.5" strokeLinecap="round"
+            style={{ animation: `tentacle3 ${parseFloat(speed) * 1.3}s ease-in-out infinite 0.1s` }} />
+        </g>
+      </svg>
+    </div>
+  );
+}
+
+// ============================================================
+// BUBBLES
+// ============================================================
+
+function Bubbles({ waterLevel }) {
+  const count = waterLevel > 0.8 ? 12 : waterLevel > 0.5 ? 7 : waterLevel > 0.2 ? 3 : 1;
+  return (
+    <>
+      <style>{`@keyframes bubbleUp{0%{transform:translateY(0) scale(1);opacity:0.7}50%{opacity:0.5}100%{transform:translateY(-200px) scale(0.3);opacity:0}}`}</style>
+      {Array.from({ length: count }).map((_, i) => {
+        const left = 15 + Math.random() * 70;
+        const size = 4 + Math.random() * 8;
+        const dur = 3 + Math.random() * 4;
+        const delay = Math.random() * 5;
+        return (
+          <div key={i} style={{
+            position: "absolute",
+            bottom: `${5 + waterLevel * 10}%`,
+            left: `${left}%`,
+            width: size, height: size,
+            borderRadius: "50%",
+            background: "radial-gradient(circle at 30% 30%, rgba(255,255,255,0.8), rgba(180,220,255,0.3))",
+            animation: `bubbleUp ${dur}s ease-in infinite ${delay}s`,
+            zIndex: 5,
+          }} />
+        );
+      })}
+    </>
+  );
+}
+
+// ============================================================
+// AQUARIUM
+// ============================================================
+
+function Aquarium({ data, onDrink, reaction }) {
+  const state = getWaterState(data.waterLevel);
+  const waterPct = Math.max(5, data.waterLevel * 85);
+
+  const bgTop = data.waterLevel > 0.6 ? "#0a1628" : data.waterLevel > 0.3 ? "#0d1f3c" : "#111827";
+  const waterColor = state.glow ? "rgba(60,140,220,0.45)" : data.waterLevel > 0.3 ? "rgba(40,100,180,0.35)" : "rgba(30,60,100,0.25)";
+
+  return (
+    <div style={{
+      position: "relative",
+      width: "100%",
+      height: 420,
+      background: `linear-gradient(180deg, ${bgTop} 0%, #0a2a4a 100%)`,
+      borderRadius: "0 0 24px 24px",
+      overflow: "hidden",
+      transition: "background 2s ease",
+    }}>
+      {/* Stars / particles at top */}
+      {state.glow && (
+        <style>{`@keyframes twinkle{0%,100%{opacity:0.3}50%{opacity:1}}`}</style>
+      )}
+      {state.glow && Array.from({ length: 8 }).map((_, i) => (
+        <div key={`star${i}`} style={{
+          position: "absolute",
+          top: `${5 + Math.random() * 20}%`,
+          left: `${10 + Math.random() * 80}%`,
+          width: 3, height: 3, borderRadius: "50%",
+          background: "#fff",
+          animation: `twinkle ${1.5 + Math.random() * 2}s ease-in-out infinite ${Math.random() * 2}s`,
+          zIndex: 2,
+        }} />
+      ))}
+
+      {/* Water body */}
+      <div style={{
+        position: "absolute",
+        bottom: 0, left: 0, right: 0,
+        height: `${waterPct}%`,
+        background: `linear-gradient(180deg, ${waterColor} 0%, rgba(10,40,80,0.6) 100%)`,
+        transition: "height 1.5s ease, background 1.5s ease",
+        zIndex: 3,
+      }}>
+        {/* Water surface wave */}
+        <div style={{
+          position: "absolute", top: -6, left: 0, right: 0, height: 12,
+          background: `linear-gradient(180deg, transparent 0%, ${waterColor} 100%)`,
+          borderRadius: "50% 50% 0 0",
+        }} />
+      </div>
+
+      {/* Jellyfish */}
+      <Jellyfish waterLevel={data.waterLevel} glow={state.glow} />
+
+      {/* Bubbles */}
+      <Bubbles waterLevel={data.waterLevel} />
+
+      {/* Bottom sand/rocks */}
+      <div style={{
+        position: "absolute", bottom: 0, left: 0, right: 0, height: 30,
+        background: "linear-gradient(180deg, rgba(60,80,100,0.3) 0%, rgba(40,55,70,0.6) 100%)",
+        zIndex: 4,
+      }} />
+
+      {/* Reaction text */}
+      {reaction && (
+        <div style={{
+          position: "absolute", top: "15%", left: "50%", transform: "translateX(-50%)",
+          background: "rgba(255,255,255,0.15)", backdropFilter: "blur(8px)",
+          borderRadius: 16, padding: "8px 18px",
+          fontSize: 15, color: "#e0f0ff", fontWeight: 700,
+          fontFamily: "'Zen Maru Gothic',sans-serif",
+          zIndex: 20, whiteSpace: "nowrap",
+          animation: "fadeInUp 0.5s ease",
+        }}>
+          {reaction}
+        </div>
+      )}
+
+      {/* Jellyfish speech */}
+      {!reaction && (
+        <div style={{
+          position: "absolute", bottom: "8%", left: "50%", transform: "translateX(-50%)",
+          fontSize: 13, color: "rgba(200,220,240,0.7)",
+          fontFamily: "'Zen Maru Gothic',sans-serif",
+          zIndex: 20, whiteSpace: "nowrap",
+          textShadow: "0 1px 4px rgba(0,0,0,0.5)",
+        }}>
+          {state.label}
+        </div>
+      )}
+
+      {/* Drink button */}
+      <button onClick={onDrink} style={{
+        position: "absolute", bottom: 16, left: "50%", transform: "translateX(-50%)",
+        background: state.glow
+          ? "linear-gradient(135deg, rgba(100,200,255,0.5), rgba(60,140,220,0.5))"
+          : "linear-gradient(135deg, rgba(80,160,220,0.4), rgba(40,100,180,0.4))",
+        backdropFilter: "blur(12px)",
+        border: "2px solid rgba(180,220,255,0.3)",
+        borderRadius: 20, padding: "12px 36px",
+        fontSize: 16, fontWeight: 700,
+        color: "#e0f0ff",
+        fontFamily: "'Zen Maru Gothic',sans-serif",
+        cursor: "pointer",
+        zIndex: 30,
+        boxShadow: state.glow ? "0 0 20px rgba(100,180,255,0.3)" : "none",
+        transition: "all 0.3s",
+      }}>
+        💧 飲んだ！
+      </button>
+    </div>
+  );
+}
+
+// ============================================================
+// STATS PANEL
+// ============================================================
+
+function StatsPanel({ data }) {
+  const streak = getStreak(data.achievedDates);
+  const today = todayKey(data);
+  const todayCount = data.history[today] || 0;
+  const state = getWaterState(data.waterLevel);
+
+  return (
+    <div style={{ padding: "12px 16px" }}>
+      {/* Today */}
+      <div style={{
+        background: "rgba(255,255,255,0.06)",
+        borderRadius: 16, padding: 14, marginBottom: 10,
+        backdropFilter: "blur(4px)",
+        border: "1px solid rgba(255,255,255,0.08)",
+      }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <div>
+            <div style={{ fontSize: 12, color: "rgba(180,210,240,0.6)" }}>今日の水分補給</div>
+            <div style={{ fontSize: 28, fontWeight: 900, color: "#c8e6ff" }}>{todayCount} 回</div>
+          </div>
+          <div style={{ textAlign: "right" }}>
+            <div style={{ fontSize: 12, color: "rgba(180,210,240,0.6)" }}>水位</div>
+            <div style={{ fontSize: 22, fontWeight: 900, color: state.glow ? "#7dd3fc" : "#94a3b8" }}>
+              {Math.round(data.waterLevel * 100)}%
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Streak & Stats */}
+      <div style={{ display: "flex", gap: 10 }}>
+        <div style={{
+          flex: 1, background: "rgba(255,255,255,0.06)", borderRadius: 16, padding: 14,
+          border: "1px solid rgba(255,255,255,0.08)", textAlign: "center",
+        }}>
+          <div style={{ fontSize: 24 }}>🔥</div>
+          <div style={{ fontSize: 20, fontWeight: 900, color: streak > 0 ? "#fbbf24" : "#475569" }}>{streak}</div>
+          <div style={{ fontSize: 10, color: "rgba(180,210,240,0.5)" }}>日連続</div>
+        </div>
+        <div style={{
+          flex: 1, background: "rgba(255,255,255,0.06)", borderRadius: 16, padding: 14,
+          border: "1px solid rgba(255,255,255,0.08)", textAlign: "center",
+        }}>
+          <div style={{ fontSize: 24 }}>📅</div>
+          <div style={{ fontSize: 20, fontWeight: 900, color: "#94a3b8" }}>{data.achievedDates.length}</div>
+          <div style={{ fontSize: 10, color: "rgba(180,210,240,0.5)" }}>累計達成日</div>
+        </div>
+        <div style={{
+          flex: 1, background: "rgba(255,255,255,0.06)", borderRadius: 16, padding: 14,
+          border: "1px solid rgba(255,255,255,0.08)", textAlign: "center",
+        }}>
+          <div style={{ fontSize: 24 }}>💧</div>
+          <div style={{ fontSize: 20, fontWeight: 900, color: "#94a3b8" }}>{data.totalDrinks}</div>
+          <div style={{ fontSize: 10, color: "rgba(180,210,240,0.5)" }}>総記録回数</div>
+        </div>
+      </div>
+
+      {/* Calendar strip */}
+      <div style={{
+        background: "rgba(255,255,255,0.06)", borderRadius: 16, padding: 14, marginTop: 10,
+        border: "1px solid rgba(255,255,255,0.08)",
+      }}>
+        <div style={{ fontSize: 11, color: "rgba(180,210,240,0.5)", marginBottom: 8 }}>直近14日</div>
+        <div style={{ display: "flex", gap: 3, justifyContent: "center" }}>
+          {Array.from({ length: 14 }).map((_, i) => {
+            const d = new Date(); d.setDate(d.getDate() - (13 - i));
+            const ds = d.toISOString().split("T")[0];
+            const achieved = data.achievedDates.includes(ds);
+            const hasRecord = (data.history[ds] || 0) > 0;
+            return (
+              <div key={ds} style={{
+                width: 20, height: 26, borderRadius: 6,
+                background: achieved ? "rgba(100,180,255,0.4)" : hasRecord ? "rgba(100,180,255,0.15)" : "rgba(255,255,255,0.04)",
+                display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+                border: `1px solid ${achieved ? "rgba(100,180,255,0.3)" : "transparent"}`,
+              }}>
+                <div style={{ fontSize: 8, color: achieved ? "#7dd3fc" : "#475569" }}>{d.getDate()}</div>
+                <div style={{ fontSize: 8 }}>{achieved ? "🌊" : hasRecord ? "💧" : "·"}</div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// MAIN APP
+// ============================================================
+
+export default function App() {
+  const [data, setData] = useState(() => {
+    const loaded = load();
+    return loaded ? applyDecay(loaded) : null;
+  });
+  const [reaction, setReaction] = useState(null);
+  const [showDebug, setShowDebug] = useState(false);
+  const reactionTimer = useRef(null);
+
+  // Save & decay tick
+  useEffect(() => { if (data) save(data); }, [data]);
+  useEffect(() => {
+    const tick = setInterval(() => {
+      setData(prev => prev ? applyDecay(prev) : null);
+    }, 60000); // update every minute
+    return () => clearInterval(tick);
+  }, []);
+
+  const handleStart = useCallback(() => setData(createData()), []);
+
+  const handleDrink = useCallback(() => {
+    if (reactionTimer.current) clearTimeout(reactionTimer.current);
+    const msg = DRINK_REACTIONS[Math.floor(Math.random() * DRINK_REACTIONS.length)];
+    setReaction(msg);
+    reactionTimer.current = setTimeout(() => setReaction(null), 2000);
+
+    setData(prev => {
+      const d = { ...prev };
+      const today = todayKey(d);
+      const prevLevel = d.waterLevel;
+      d.waterLevel = Math.min(1, d.waterLevel + DRINK_AMOUNT);
+      d.lastUpdate = Date.now();
+      d.history = { ...d.history, [today]: (d.history[today] || 0) + 1 };
+      d.totalDrinks = (d.totalDrinks || 0) + 1;
+
+      // Achievement: reaching full today
+      if (prevLevel < 0.9 && d.waterLevel >= 0.9 && !d.achievedDates.includes(today)) {
+        d.achievedDates = [...d.achievedDates, today];
+        const streak = getStreak(d.achievedDates);
+        if (streak > (d.streakBest || 0)) d.streakBest = streak;
+      }
+      return d;
+    });
+  }, []);
+
+  const advanceDay = useCallback(() => {
+    setData(prev => {
+      const d = { ...prev };
+      const cur = d.debugDate || new Date().toISOString().split("T")[0];
+      const next = new Date(cur); next.setDate(next.getDate() + 1);
+      d.debugDate = next.toISOString().split("T")[0];
+      d.waterLevel = Math.max(0, d.waterLevel - 0.4);
+      return d;
+    });
+  }, []);
+
+  if (!data) {
+    return (
+      <div style={{
+        minHeight: "100vh",
+        background: "linear-gradient(180deg, #0a1628 0%, #0a2a4a 100%)",
+        display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+        fontFamily: "'Zen Maru Gothic',sans-serif", padding: 24,
+      }}>
+        <link href="https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@400;700;900&display=swap" rel="stylesheet" />
+        <style>{`@keyframes gentleFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-10px)}}`}</style>
+        <div style={{ fontSize: 80, marginBottom: 16, animation: "gentleFloat 4s ease-in-out infinite" }}>🪼</div>
+        <h1 style={{ fontSize: 26, fontWeight: 900, color: "#c8e6ff", marginBottom: 4 }}>くらげすいそう</h1>
+        <p style={{ fontSize: 13, color: "rgba(180,210,240,0.5)", marginBottom: 40 }}>水を飲んで、くらげを元気にしよう</p>
+        <button onClick={handleStart} style={{
+          background: "linear-gradient(135deg, rgba(80,160,220,0.5), rgba(40,100,180,0.5))",
+          backdropFilter: "blur(12px)",
+          border: "2px solid rgba(180,220,255,0.2)",
+          borderRadius: 16, padding: "16px 48px",
+          fontSize: 17, fontWeight: 700, color: "#c8e6ff",
+          fontFamily: "'Zen Maru Gothic',sans-serif",
+          cursor: "pointer",
+        }}>
+          💧 はじめる
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{
+      minHeight: "100vh",
+      background: "linear-gradient(180deg, #0a1628 0%, #0e2240 50%, #0a1628 100%)",
+      fontFamily: "'Zen Maru Gothic',sans-serif", color: "#c8e6ff",
+    }}>
+      <link href="https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@400;700;900&display=swap" rel="stylesheet" />
+      <style>{`@keyframes fadeInUp{from{opacity:0;transform:translateX(-50%) translateY(10px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}`}</style>
+
+      {/* Header */}
+      <div style={{
+        padding: "12px 16px",
+        display: "flex", justifyContent: "space-between", alignItems: "center",
+        position: "relative", zIndex: 40,
+      }}>
+        <div style={{ fontSize: 16, fontWeight: 900 }}>🪼 くらげすいそう</div>
+        <div style={{ textAlign: "right" }}>
+          {data.debugDate && <div style={{ fontSize: 10, color: "#f87171" }}>🐛 {data.debugDate}</div>}
+        </div>
+      </div>
+
+      {/* Aquarium */}
+      <Aquarium data={data} onDrink={handleDrink} reaction={reaction} />
+
+      {/* Stats */}
+      <StatsPanel data={data} />
+
+      {/* Debug */}
+      <div style={{ textAlign: "center", padding: "20px 0 60px" }}>
+        <button style={{
+          background: "transparent", border: "1px solid rgba(255,255,255,0.1)",
+          borderRadius: 8, padding: "6px 14px", fontSize: 11,
+          color: "rgba(180,210,240,0.3)", cursor: "pointer",
+          fontFamily: "'Zen Maru Gothic',sans-serif",
+        }} onClick={() => setShowDebug(!showDebug)}>
+          🐛 デバッグ {showDebug ? "▲" : "▼"}
+        </button>
+        {showDebug && (
+          <div style={{ display: "flex", gap: 8, justifyContent: "center", flexWrap: "wrap", marginTop: 8 }}>
+            <button style={{ background: "rgba(100,180,255,0.2)", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 11, color: "#7dd3fc", cursor: "pointer", fontFamily: "'Zen Maru Gothic',sans-serif" }} onClick={advanceDay}>📅 1日進める</button>
+            <button style={{ background: "rgba(100,180,255,0.2)", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 11, color: "#7dd3fc", cursor: "pointer", fontFamily: "'Zen Maru Gothic',sans-serif" }} onClick={() => setData(p => ({ ...p, debugDate: null }))}>🔄 日付リセ</button>
+            <button style={{ background: "rgba(255,100,100,0.2)", border: "none", borderRadius: 8, padding: "6px 12px", fontSize: 11, color: "#f87171", cursor: "pointer", fontFamily: "'Zen Maru Gothic',sans-serif" }} onClick={() => { if (confirm("全データ削除？")) { localStorage.removeItem(STORAGE_KEY); setData(null); } }}>🗑️ 全削除</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
